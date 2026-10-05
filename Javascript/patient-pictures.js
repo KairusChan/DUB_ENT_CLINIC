@@ -1,0 +1,243 @@
+// Pictures are resized locally, then uploaded to private Supabase Storage.
+class PatientPictures {
+    constructor(root, pictures = [], editable = true) {
+        this.root = root;
+        this.pictures = [...pictures];
+        this.editable = editable;
+        this.busy = false;
+        this.render();
+    }
+
+    render() {
+        this.root.replaceChildren();
+        const heading = document.createElement('h3');
+        heading.textContent = 'Picture Patient Record';
+        this.root.append(heading);
+        const help = document.createElement('p');
+        help.textContent = `${this.pictures.length} of 4 pictures. ${this.editable ? 'Optional: upload or capture 1 to 4 pictures. JPEG, PNG or WebP, up to 10 MB each.' : ''}`;
+        this.root.append(help);
+        const grid = document.createElement('div');
+        grid.className = 'patient-picture-grid';
+        this.pictures.forEach((source, index) => {
+            const card = document.createElement('div');
+            const img = document.createElement('img');
+            if (source.startsWith('data:image/')) img.src = source;
+            else {
+                window.entSupabase.storage.from(PatientPictures.bucket)
+                    .createSignedUrl(source, 3600).then(({ data, error }) => {
+                        if (error) { img.alt += ' (unable to load)'; return; }
+                        img.src = data.signedUrl;
+                    }).catch(() => { img.alt += ' (unable to load)'; });
+            }
+            img.alt = `Patient record picture ${index + 1}`;
+            const preview = document.createElement('button');
+            preview.type = 'button';
+            preview.className = 'patient-picture-preview';
+            preview.setAttribute('aria-label', `Enlarge patient record picture ${index + 1}`);
+            preview.addEventListener('click', () => this.zoom(img, preview));
+            preview.append(img);
+            card.append(preview);
+            if (this.editable) {
+                card.append(this.button('Remove', () => { this.pictures.splice(index, 1); this.render(); }));
+                card.append(this.button('Retake capture', () => this.pick(true, index)));
+            }
+            grid.append(card);
+        });
+        this.root.append(grid);
+        if (this.editable && this.pictures.length < 4) {
+            this.root.append(this.button('Upload pictures', () => this.pick(false)));
+            this.root.append(this.button('Capture picture', () => this.pick(true)));
+        }
+        this.status = document.createElement('p');
+        this.status.setAttribute('role', 'status');
+        this.root.append(this.status);
+    }
+
+    zoom(source, trigger) {
+        if (!source.getAttribute('src')) return;
+        const dialog = document.createElement('dialog');
+        dialog.className = 'patient-picture-dialog';
+        dialog.setAttribute('aria-label', source.alt);
+        const toolbar = document.createElement('div');
+        toolbar.className = 'picture-zoom-toolbar';
+        const image = document.createElement('img');
+        image.src = source.src;
+        image.alt = source.alt;
+        const viewport = document.createElement('div');
+        viewport.className = 'picture-zoom-viewport';
+        viewport.append(image);
+        let scale = 1;
+        const resize = value => {
+            scale = Math.max(1, Math.min(4, value));
+            image.style.width = `${scale * 100}%`;
+            zoomOut.disabled = scale === 1;
+            zoomIn.disabled = scale === 4;
+            label.textContent = `${Math.round(scale * 100)}%`;
+        };
+        const zoomOut = this.button('Zoom out', () => resize(scale - 0.5));
+        const zoomIn = this.button('Zoom in', () => resize(scale + 0.5));
+        const reset = this.button('Fit picture', () => resize(1));
+        const close = this.button('Close', () => dialog.close());
+        const label = document.createElement('span');
+        label.setAttribute('aria-live', 'polite');
+        toolbar.append(zoomOut, label, zoomIn, reset, close);
+        dialog.append(toolbar, viewport);
+        dialog.addEventListener('close', () => { dialog.remove(); trigger.focus(); }, { once: true });
+        dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+        document.body.append(dialog);
+        resize(1);
+        dialog.showModal();
+        close.focus();
+    }
+
+    button(label, action) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'outline';
+        button.textContent = label;
+        button.disabled = this.busy;
+        button.addEventListener('click', action);
+        return button;
+    }
+
+    pick(capture, index = null) {
+        if (capture) {
+            if (window.entCamera) {
+                this.captureWithCamera(() => window.entCamera.capture(), index);
+                return;
+            }
+            if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+                this.captureWithCamera(() => this.captureFromBrowser(), index);
+                return;
+            }
+        }
+        const input = document.createElement('input');
+        input.type = 'file';
+        // Capacitor's Android camera handler checks for the literal image/* type.
+        input.accept = capture ? 'image/*' : 'image/jpeg,image/png,image/webp';
+        input.multiple = !capture && index === null;
+        if (capture) input.setAttribute('capture', 'environment');
+        input.addEventListener('change', () => this.addFiles([...input.files], index));
+        input.click();
+    }
+
+    async captureWithCamera(capture, index = null) {
+        if (this.busy) return;
+        this.busy = true;
+        this.render();
+        this.status.textContent = 'Opening camera…';
+        try {
+            const dataUrl = await capture();
+            const response = await fetch(dataUrl);
+            const file = new File([await response.blob()], `patient-picture-${Date.now()}.jpg`, { type: 'image/jpeg' });
+            this.busy = false;
+            await this.addFiles([file], index);
+        } catch (error) {
+            this.busy = false;
+            this.render();
+            if (error?.message?.toLowerCase().includes('cancel')) return;
+            this.status.textContent = 'Unable to open the camera. Allow camera access in your browser or device settings, or use Upload pictures.';
+        }
+    }
+
+    async captureFromBrowser() {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+        const dialog = document.createElement('dialog');
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.playsInline = true;
+        video.srcObject = stream;
+        const capture = document.createElement('button');
+        capture.type = 'button';
+        capture.textContent = 'Take picture';
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.textContent = 'Cancel';
+        dialog.append(video, capture, cancel);
+        document.body.append(dialog);
+        dialog.showModal();
+        const close = () => {
+            stream.getTracks().forEach(track => track.stop());
+            dialog.remove();
+        };
+        const dataUrl = await new Promise((resolve, reject) => {
+            cancel.addEventListener('click', () => { close(); reject(new Error('cancelled')); }, { once: true });
+            capture.addEventListener('click', () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0);
+                resolve(canvas.toDataURL('image/jpeg', 0.9));
+                close();
+            }, { once: true });
+            dialog.addEventListener('cancel', () => { close(); reject(new Error('cancelled')); }, { once: true });
+        });
+        return dataUrl;
+    }
+
+    async addFiles(files, index = null) {
+        if (!files.length || this.busy) return;
+        if (files.length > (index === null ? 4 - this.pictures.length : 1)) {
+            this.status.textContent = 'Select no more than four pictures in total.';
+            return;
+        }
+        this.busy = true;
+        this.render();
+        this.status.textContent = 'Preparing pictures…';
+        try {
+            const pictures = [];
+            for (const file of files) pictures.push(await PatientPictures.encode(file));
+            if (index === null) this.pictures.push(...pictures);
+            else this.pictures[index] = pictures[0];
+            this.busy = false;
+            this.render();
+        } catch (error) {
+            this.busy = false;
+            this.render();
+            this.status.textContent = error.message;
+        }
+    }
+
+    static bucket = 'PatientRecordUploads';
+
+    async upload(client) {
+        // Replace each successful upload in place so a retry reuses its object.
+        for (let index = 0; index < this.pictures.length; index++) {
+            const source = this.pictures[index];
+            if (!source.startsWith('data:image/')) continue;
+            const blob = await (await fetch(source)).blob();
+            const path = `records/${crypto.randomUUID()}.jpg`;
+            const { error } = await client.storage.from(PatientPictures.bucket)
+                .upload(path, blob, { contentType: 'image/jpeg', upsert: false });
+            if (error) throw new Error(`Picture upload failed: ${error.message}`);
+            this.pictures[index] = path;
+        }
+        return [...this.pictures];
+    }
+
+    static async encode(file) {
+        if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 10 * 1024 * 1024) {
+            throw new Error('Choose a JPEG, PNG or WebP picture smaller than 10 MB.');
+        }
+        const url = URL.createObjectURL(file);
+        try {
+            const img = new Image();
+            img.src = url;
+            await img.decode();
+            const scale = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+            canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            const data = canvas.toDataURL('image/jpeg', 0.8);
+            if (data.length > 1500000) throw new Error('This picture is too detailed. Choose a smaller picture.');
+            return data;
+        } catch (error) {
+            throw new Error(error.message.includes('too detailed') ? error.message : 'Unable to read this picture. Choose another file.');
+        } finally { URL.revokeObjectURL(url); }
+    }
+}
+window.PatientPictures = PatientPictures;
